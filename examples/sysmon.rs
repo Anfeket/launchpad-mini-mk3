@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use launchpad::{Launchpad, RGB};
+use launchpad_mini_mk3::{Launchpad, RGB};
 
 const COLOR_LAPS: [RGB; 10] = [
     RGB::new(0, 0, 127),

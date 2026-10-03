@@ -1,6 +1,6 @@
-# launchpad
+# launchpad-mini-mk3
 
-A lightweight Rust library for controlling the **Launchpad Mini [MK3]** over MIDI SysEx messages.
+A lightweight Rust library for controlling the **Novation Launchpad Mini [MK3]** over MIDI SysEx messages.
 
 ---
 
@@ -25,7 +25,14 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-launchpad = { git = "https://github.com/anfeket/launchpad" }
+launchpad-mini-mk3 = "0.1.0"
+```
+
+Or directly from GitHub:
+
+```toml
+[dependencies]
+launchpad-mini-mk3 = { git = "https://github.com/anfeket/launchpad-mini-mk3" }
 ```
 
 ---
@@ -33,7 +40,7 @@ launchpad = { git = "https://github.com/anfeket/launchpad" }
 ## Quick Start
 
 ```rust
-use launchpad::{Launchpad, Button, RGB};
+use launchpad_mini_mk3::{Launchpad, Button, RGB};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to attached Launchpad

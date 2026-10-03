@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use launchpad::{Launchpad, RGB};
+use launchpad_mini_mk3::{Launchpad, RGB};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();

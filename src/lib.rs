@@ -8,7 +8,7 @@
 //!
 //! # Example
 //! ```no_run
-//! use launchpad::{Launchpad, Button, RGB};
+//! use launchpad_mini_mk3::{Launchpad, Button, RGB};
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let mut launchpad = Launchpad::new()?;

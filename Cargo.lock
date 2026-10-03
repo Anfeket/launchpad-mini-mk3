@@ -257,7 +257,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "launchpad"
+name = "launchpad-mini-mk3"
 version = "0.1.0"
 dependencies = [
  "midir",
