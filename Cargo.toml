@@ -1,0 +1,14 @@
+[package]
+name = "launchpad"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight Rust library for controlling Novation Launchpad (Mini MK3) devices over MIDI SysEx"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/anfeket/launchpad"
+readme = "README.md"
+keywords = ["launchpad", "midi", "novation", "sysex", "music"]
+categories = ["multimedia::audio", "hardware-support"]
+exclude = ["*.raw", "*.webm", "*.mp4"]
+
+[dependencies]
+midir = "0.11.0"
