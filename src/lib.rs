@@ -5,6 +5,7 @@
 //! - Whole-grid (9x9) RGB frame rendering
 //! - LED control with Palette colors or 24-bit (7-bit per channel) RGB
 //! - Scrolling text display
+//! - Real-time MIDI input reading and buffer flushing (prevents device freezes)
 //!
 //! # Example
 //! ```no_run
@@ -23,7 +24,12 @@
 //! }
 //! ```
 
-use std::fmt;
+use std::{
+    collections::VecDeque,
+    fmt,
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
+};
 
 #[derive(Debug)]
 pub enum Error {
@@ -33,8 +39,10 @@ pub enum Error {
     PortInfo(midir::PortInfoError),
     /// No connected Launchpad Mini MK3 was detected.
     DeviceNotFound,
-    /// Failed to open a connection to the Launchpad MIDI port.
+    /// Failed to open a connection to the Launchpad MIDI output port.
     Connection(midir::ConnectError<midir::MidiOutput>),
+    /// Failed to open a connection to the Launchpad MIDI input port.
+    InputConnection(midir::ConnectError<midir::MidiInput>),
     /// Failed to send a MIDI message to the device (e.g. disconnected).
     Send(midir::SendError),
 }
@@ -48,7 +56,8 @@ impl fmt::Display for Error {
                 f,
                 "no Launchpad Mini MK3 found (check USB connection and permissions)"
             ),
-            Error::Connection(e) => write!(f, "failed to connect to Launchpad: {e}"),
+            Error::Connection(e) => write!(f, "failed to connect to Launchpad output: {e}"),
+            Error::InputConnection(e) => write!(f, "failed to connect to Launchpad input: {e}"),
             Error::Send(e) => write!(f, "failed to send MIDI message to Launchpad: {e}"),
         }
     }
@@ -59,6 +68,7 @@ impl std::error::Error for Error {
             Error::MidiInit(e) => Some(e),
             Error::PortInfo(e) => Some(e),
             Error::Connection(e) => Some(e),
+            Error::InputConnection(e) => Some(e),
             Error::Send(e) => Some(e),
             Error::DeviceNotFound => None,
         }
@@ -80,6 +90,12 @@ impl From<midir::PortInfoError> for Error {
 impl From<midir::ConnectError<midir::MidiOutput>> for Error {
     fn from(e: midir::ConnectError<midir::MidiOutput>) -> Self {
         Error::Connection(e)
+    }
+}
+
+impl From<midir::ConnectError<midir::MidiInput>> for Error {
+    fn from(e: midir::ConnectError<midir::MidiInput>) -> Self {
+        Error::InputConnection(e)
     }
 }
 
@@ -220,18 +236,66 @@ impl RGB {
     }
 }
 
+/// An unparsed incoming MIDI message received from the Launchpad Mini MK3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    /// Timestamp in microseconds (relative to an arbitrary point in time when the input was opened).
+    pub timestamp: u64,
+    /// Raw MIDI bytes received from the device.
+    pub bytes: Vec<u8>,
+}
+
+impl Message {
+    /// Creates a new `Message` from a timestamp and raw MIDI bytes.
+    #[must_use]
+    pub const fn new(timestamp: u64, bytes: Vec<u8>) -> Self {
+        Self { timestamp, bytes }
+    }
+
+    /// Returns a slice to the raw MIDI bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::ops::Deref for Message {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+impl AsRef<[u8]> for Message {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+const DEFAULT_INCOMING_CAPACITY: usize = 1024;
+
+#[derive(Debug)]
+struct InnerQueue {
+    messages: VecDeque<Message>,
+    capacity: usize,
+}
+
 /// Handle to a connected Launchpad Mini MK3 MIDI device.
 pub struct Launchpad {
     connection: midir::MidiOutputConnection,
+    _input_connection: midir::MidiInputConnection<()>,
+    queue: Arc<(Mutex<InnerQueue>, Condvar)>,
     name: String,
+    input_name: String,
 }
 
 impl Launchpad {
-    /// Attempts to locate and connect to an attached Launchpad Mini MK3 MIDI output port.
+    /// Attempts to locate and connect to an attached Launchpad Mini MK3 MIDI input and output ports.
     pub fn new() -> Result<Self> {
         let output = midir::MidiOutput::new("Launchpad")?;
 
-        let launchpad_port = output
+        let launchpad_out_port = output
             .ports()
             .into_iter()
             .find(|port| {
@@ -240,16 +304,168 @@ impl Launchpad {
             })
             .ok_or(Error::DeviceNotFound)?;
 
-        let name = output.port_name(&launchpad_port)?;
-        let connection = output.connect(&launchpad_port, "Launchpad Connection")?;
+        let name = output.port_name(&launchpad_out_port)?;
+        let connection = output.connect(&launchpad_out_port, "Launchpad Connection")?;
 
-        Ok(Launchpad { connection, name })
+        let mut input = midir::MidiInput::new("Launchpad Input")?;
+        input.ignore(midir::Ignore::None);
+
+        let launchpad_in_port = input
+            .ports()
+            .into_iter()
+            .find(|port| {
+                let name = input.port_name(port).unwrap_or_default();
+                name.contains("LPMiniMK3") && name.contains("MI")
+            })
+            .ok_or(Error::DeviceNotFound)?;
+
+        let input_name = input.port_name(&launchpad_in_port)?;
+
+        let queue = Arc::new((
+            Mutex::new(InnerQueue {
+                messages: VecDeque::with_capacity(128),
+                capacity: DEFAULT_INCOMING_CAPACITY,
+            }),
+            Condvar::new(),
+        ));
+
+        let queue_clone = Arc::clone(&queue);
+        let input_connection = input.connect(
+            &launchpad_in_port,
+            "Launchpad Input Connection",
+            move |timestamp, bytes, ()| {
+                let (lock, cvar) = &*queue_clone;
+                if let Ok(mut inner) = lock.lock() {
+                    if inner.messages.len() >= inner.capacity {
+                        inner.messages.pop_front();
+                    }
+                    inner.messages.push_back(Message {
+                        timestamp,
+                        bytes: bytes.to_vec(),
+                    });
+                    cvar.notify_one();
+                }
+            },
+            (),
+        )?;
+
+        Ok(Launchpad {
+            connection,
+            _input_connection: input_connection,
+            queue,
+            name,
+            input_name,
+        })
     }
 
-    /// Returns the port name of the connected Launchpad.
+    /// Returns the output port name of the connected Launchpad.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the input port name of the connected Launchpad.
+    #[must_use]
+    pub fn input_name(&self) -> &str {
+        &self.input_name
+    }
+
+    /// Polls for the next received message without blocking.
+    ///
+    /// Returns `Some(Message)` if a message is available, or `None` if the queue is empty.
+    pub fn poll_message(&mut self) -> Option<Message> {
+        let (lock, _) = &*self.queue;
+        lock.lock().ok()?.messages.pop_front()
+    }
+
+    /// Blocks until a message is received from the Launchpad, or returns `None` if the queue was poisoned.
+    pub fn read_message(&mut self) -> Option<Message> {
+        let (lock, cvar) = &*self.queue;
+        let mut inner = lock.lock().ok()?;
+        loop {
+            if let Some(msg) = inner.messages.pop_front() {
+                return Some(msg);
+            }
+            inner = cvar.wait(inner).ok()?;
+        }
+    }
+
+    /// Waits up to `timeout` for a message to arrive from the Launchpad.
+    ///
+    /// Returns `Some(Message)` if a message arrived within the timeout, or `None` if timed out.
+    pub fn read_message_timeout(&mut self, timeout: Duration) -> Option<Message> {
+        let (lock, cvar) = &*self.queue;
+        let mut inner = lock.lock().ok()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(msg) = inner.messages.pop_front() {
+                return Some(msg);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (new_inner, timeout_result) = cvar.wait_timeout(inner, remaining).ok()?;
+            inner = new_inner;
+            if timeout_result.timed_out() && inner.messages.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    /// Flushes all pending incoming messages from the buffer, discarding them.
+    ///
+    /// Useful for clearing stale events (e.g. initial mode switch acknowledgements
+    /// or old pad presses) before entering an event loop.
+    pub fn flush(&mut self) {
+        let (lock, _) = &*self.queue;
+        if let Ok(mut inner) = lock.lock() {
+            inner.messages.clear();
+        }
+    }
+
+    /// Drains and returns all currently pending incoming messages as a `Vec<Message>`.
+    pub fn drain_messages(&mut self) -> Vec<Message> {
+        let (lock, _) = &*self.queue;
+        if let Ok(mut inner) = lock.lock() {
+            inner.messages.drain(..).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Returns the number of unread messages currently buffered.
+    #[must_use]
+    pub fn incoming_count(&self) -> usize {
+        let (lock, _) = &*self.queue;
+        lock.lock().map(|inner| inner.messages.len()).unwrap_or(0)
+    }
+
+    /// Returns `true` if there are no pending incoming messages.
+    #[must_use]
+    pub fn is_incoming_empty(&self) -> bool {
+        let (lock, _) = &*self.queue;
+        lock.lock().map(|inner| inner.messages.is_empty()).unwrap_or(true)
+    }
+
+    /// Sets the maximum capacity of the incoming message queue.
+    ///
+    /// If more messages arrive than this limit without being read, the oldest messages
+    /// are dropped to avoid unbounded memory growth.
+    pub fn set_incoming_capacity(&mut self, capacity: usize) {
+        let (lock, _) = &*self.queue;
+        if let Ok(mut inner) = lock.lock() {
+            inner.capacity = capacity;
+            while inner.messages.len() > capacity {
+                inner.messages.pop_front();
+            }
+        }
+    }
+
+    /// Returns an iterator over all currently available incoming messages, consuming them.
+    pub fn incoming_messages(&mut self) -> impl Iterator<Item = Message> + '_ {
+        std::iter::from_fn(|| self.poll_message())
     }
 
     /// Sends a raw SysEx message wrapped in the standard Launchpad Mini MK3 header and footer.
@@ -459,5 +675,33 @@ mod tests {
     #[should_panic(expected = "Red channel value must be 0–127")]
     fn test_rgb_new_panics_on_invalid_red() {
         let _ = RGB::new(128, 0, 0);
+    }
+
+    #[test]
+    fn test_message_deref_and_bytes() {
+        let msg = Message::new(12345, vec![0x90, 0x3C, 0x7F]);
+        assert_eq!(msg.timestamp, 12345);
+        assert_eq!(msg.as_bytes(), &[0x90, 0x3C, 0x7F]);
+        assert_eq!(&msg[..], &[0x90, 0x3C, 0x7F]);
+        assert_eq!(msg.len(), 3);
+        assert_eq!(msg[0], 0x90);
+    }
+
+    #[test]
+    fn test_inner_queue_capacity() {
+        let mut q = InnerQueue {
+            messages: VecDeque::new(),
+            capacity: 2,
+        };
+        for i in 0..5 {
+            if q.messages.len() >= q.capacity {
+                q.messages.pop_front();
+            }
+            q.messages.push_back(Message::new(i, vec![i as u8]));
+        }
+        assert_eq!(q.messages.len(), 2);
+        assert_eq!(q.messages.pop_front().unwrap().timestamp, 3);
+        assert_eq!(q.messages.pop_front().unwrap().timestamp, 4);
+        assert!(q.messages.is_empty());
     }
 }

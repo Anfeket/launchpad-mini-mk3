@@ -16,6 +16,7 @@ A lightweight Rust library for controlling the **Novation Launchpad Mini [MK3]**
   - `Button::Logo`
 - **RGB & Palette Support**: Control individual or batched LEDs using 7-bit RGB (`0..=127` per channel) or the built-in 128-color palette.
 - **Text Scrolling**: Native SysEx ASCII text scrolling across pads.
+- **MIDI Input Reading & Buffer Flushing**: Automatically connects to the MIDI input port to continuously drain incoming events, preventing device hardware freezes. Provides non-blocking polling, blocking reads, timeouts, and flush/drain methods.
 
 ---
 
@@ -43,12 +44,13 @@ launchpad-mini-mk3 = { git = "https://github.com/anfeket/launchpad-mini-mk3" }
 use launchpad_mini_mk3::{Launchpad, Button, RGB};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Connect to attached Launchpad
+    // Connect to attached Launchpad (opens both output and input ports)
     let mut launchpad = Launchpad::new()?;
     println!("Connected to: {}", launchpad.name());
 
     // Switch to Programmer Mode
     launchpad.programmer_mode()?;
+    launchpad.flush(); // Clear initial mode ACK and stale events
     launchpad.clear()?;
 
     // Light up the top-left pad green
@@ -65,7 +67,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Examples
 
-### 1. System Resource Monitor (`sysmon`)
+### 1. MIDI Input Monitor (`read_midi`)
+
+Demonstrates reading real-time button/pad events and SysEx messages while keeping buffers flushed:
+
+```sh
+cargo run --example read_midi
+```
+
+### 2. System Resource Monitor (`sysmon`)
 
 Monitors your Linux system's per-core CPU usage and memory consumption in real time on the 9x9 LED grid.
 
@@ -91,7 +101,7 @@ cargo run --example video_player -- path/to/video.raw
 ffmpeg -i input.mp4 -vf "scale=9:9:flags=area,fps=30" -c:v rawvideo -pix_fmt rgb24 output.raw
 ```
 
-### 2. Bad Apple (`bad_apple`)
+### 4. Bad Apple (`bad_apple`)
 
 Obligatory Bad Apple player, plays 30 FPS grayscale video on the grid:
 

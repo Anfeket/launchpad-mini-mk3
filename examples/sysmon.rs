@@ -1,6 +1,6 @@
 //! System resource monitor for Linux.
 //!
-//! Renders per-core CPU load and system RAM usage on a Novation Launchpad Mini MK3.
+//! Renders CPU load, system RAM usage and network transmit rate on Launchpad Mini MK3.
 //!
 //! Run with:
 //! ```sh
@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use launchpad_mini_mk3::{Launchpad, RGB};
@@ -32,6 +32,9 @@ const COLOR_LAPS: [RGB; 10] = [
     RGB::new(70, 0, 127),
     RGB::new(127, 127, 127),
 ];
+
+const NET_MAX: u64 = 1e9 as u64 / 8 as u64; // 1 GB
+const NET_GAMMA: f32 = 0.6;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut launchpad = Launchpad::new().expect("Failed to initialize Launchpad");
@@ -59,6 +62,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut prev_cpus = cpus.clone();
     let mut prev_mem_usage = read_mem_usage(&mut meminfo, &mut meminfo_buf)?;
+
+    let net_interface = "eno1";
+    let mut net_rx_bytes = File::open(format!(
+        "/sys/class/net/{}/statistics/rx_bytes",
+        net_interface
+    ))?;
+    let mut net_tx_bytes = File::open(format!(
+        "/sys/class/net/{}/statistics/tx_bytes",
+        net_interface
+    ))?;
+    let mut net_buf = String::with_capacity(64);
+    let mut prev_rx_bytes = read_net_bytes(&mut net_rx_bytes, &mut net_buf)?;
+    let mut prev_tx_bytes = read_net_bytes(&mut net_tx_bytes, &mut net_buf)?;
+
+    let mut last_rx_level = 0.0;
+    let mut last_tx_level = 0.0;
+
+    let mut last_instant = Instant::now();
 
     let quit = Arc::new(AtomicBool::new(false));
     let quit_clone = quit.clone();
@@ -129,8 +150,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         prev_mem_usage = (total_mem, free_mem);
 
+        let rx_bytes = read_net_bytes(&mut net_rx_bytes, &mut net_buf)?;
+        let tx_bytes = read_net_bytes(&mut net_tx_bytes, &mut net_buf)?;
+
+        let dt = last_instant.elapsed().as_secs_f32();
+        last_instant = Instant::now();
+
+        let rx_rate = rx_bytes.saturating_sub(prev_rx_bytes) as f32 / dt;
+        let tx_rate = tx_bytes.saturating_sub(prev_tx_bytes) as f32 / dt;
+
+        let mut rx_level = (rx_rate / NET_MAX as f32).powf(NET_GAMMA) * 8.0;
+        let mut tx_level = (tx_rate / NET_MAX as f32).powf(NET_GAMMA) * 8.0;
+
+        if last_rx_level < rx_level {
+            rx_level *= 0.95;
+        };
+        if last_tx_level < tx_level {
+            tx_level *= 0.95;
+        };
+
+        last_rx_level = rx_level;
+        last_tx_level = tx_level;
+
+        for i in 0..8 {
+            let pos = 36 + i;
+            if i == rx_level.floor() as usize {
+                let frac = rx_level - rx_level.floor();
+                let color = (182.0 * frac, 146.0 * frac, 123.0 * frac);
+                frame[pos] = RGB::from_8bit(color.0 as u8, color.1 as u8, color.2 as u8);
+            } else if (i as f32) < rx_level {
+                frame[pos] = RGB::from_8bit(182, 146, 123);
+            } else {
+                frame[pos] = RGB::BLACK;
+            }
+        }
+
+        for i in 0..8 {
+            let pos = 45 + i;
+            if i == tx_level.floor() as usize {
+                let frac = tx_level - tx_level.floor();
+                let color = (123.0 * frac, 182.0 * frac, 146.0 * frac);
+                frame[pos] = RGB::from_8bit(color.0 as u8, color.1 as u8, color.2 as u8);
+            } else if (i as f32) < tx_level {
+                frame[pos] = RGB::from_8bit(123, 182, 146);
+            } else {
+                frame[pos] = RGB::BLACK;
+            }
+        }
+
+        prev_rx_bytes = rx_bytes;
+        prev_tx_bytes = tx_bytes;
+
         launchpad.set_frame(&frame)?;
-        thread::sleep(Duration::from_millis(50));
+        launchpad.flush();
+
+        thread::sleep(Duration::from_millis(50).saturating_sub(last_instant.elapsed()));
 
         if quit.load(Ordering::Relaxed) {
             break;
@@ -139,6 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     launchpad.clear()?;
     launchpad.standalone_mode()?;
+    launchpad.flush();
     Ok(())
 }
 
@@ -200,4 +275,11 @@ fn read_mem_usage(
     }
 
     Ok((total, free))
+}
+
+fn read_net_bytes(stat: &mut File, buf: &mut String) -> Result<u64, Box<dyn std::error::Error>> {
+    buf.clear();
+    stat.seek(SeekFrom::Start(0))?;
+    stat.read_to_string(buf)?;
+    Ok(buf.trim().parse::<u64>().unwrap_or(0))
 }
